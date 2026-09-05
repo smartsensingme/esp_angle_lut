@@ -1,8 +1,11 @@
 # ESP angular linearization LUT
 
 This reusable component applies a cyclic, linearly interpolated correction to
-a 14-bit absolute angle. A double runtime buffer lets the real-time reader run
-without locks while a new table is installed from another core.
+an absolute angle. The native counts per revolution are selected with
+`CONFIG_ESP_ANGLE_LUT_FULL_SCALE_COUNTS` (256 through 65536, power of two), so
+the same component can serve 8- through 16-bit sensors. A double runtime buffer
+lets the real-time reader run without locks while a new table is installed from
+another core.
 
 Two NVS slots protect the last valid calibration against an interrupted write.
 Each table carries a format version, generation and IEEE CRC32. Uploads are
@@ -11,5 +14,11 @@ or the corrected angular map would cease to be monotonic. New tables are
 installed disabled and must be explicitly enabled after host-side validation.
 
 The table is expressed in signed native sensor counts and spans one revolution.
-Call `esp_angle_lut_apply()` after sensor direction/zero processing and before
-angle unwrapping, speed estimation or control.
+The install API requires its source full scale and rejects a table generated
+for a different resolution. Call `esp_angle_lut_apply()` after sensor
+direction/zero processing and before angle unwrapping, speed estimation or
+control.
+
+The default is 16384 counts for compatibility with the MT6701 and stored
+format-version-1 tables. Changing the configured resolution invalidates tables
+from another scale and normally requires a new calibration.

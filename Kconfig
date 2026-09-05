@@ -1,19 +1,32 @@
 menu "Angular linearization LUT"
 
+    config ESP_ANGLE_LUT_FULL_SCALE_COUNTS
+        int "Angle sensor counts per revolution"
+        range 256 65536
+        default 16384
+        help
+            Number of distinct native angle counts in one revolution. It must
+            be a power of two and no smaller than the LUT bin count. Typical
+            values are 4096 for a 12-bit sensor, 16384 for a 14-bit sensor and
+            65536 for a 16-bit sensor.
+
     config ESP_ANGLE_LUT_BIN_COUNT
         int "Angular correction table bins"
         range 16 256
         default 256
         help
             Number of equally spaced bins over one revolution. The value must
-            be a power of two that divides the MT6701 14-bit range (16384).
+            be a power of two that divides the configured sensor full scale.
 
     config ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS
         int "Maximum accepted absolute correction (sensor counts)"
-        range 1 4096
+        range 1 32767
         default 1024
         help
-            Reject uploaded tables containing a larger correction. For the
-            MT6701, 1024 counts correspond to 22.5 degrees.
+            Reject uploaded tables containing a larger correction, expressed
+            in native sensor counts. With the default 16384-count scale, 1024
+            counts correspond to 22.5 degrees. Adjust this value when changing
+            sensor resolution if the same angular limit is desired. At runtime
+            the accepted limit is clamped below half a revolution.
 
 endmenu

@@ -12,8 +12,12 @@
 #define LUT_NVS_ACTIVE_KEY "active"
 #define LUT_NVS_ENABLED_KEY "enabled"
 
-#if (ESP_ANGLE_LUT_SENSOR_COUNTS % ESP_ANGLE_LUT_BIN_COUNT) != 0
-#error "ESP_ANGLE_LUT_BIN_COUNT must divide 16384"
+#if (ESP_ANGLE_LUT_FULL_SCALE_COUNTS &                                         \
+     (ESP_ANGLE_LUT_FULL_SCALE_COUNTS - 1)) != 0
+#error "ESP_ANGLE_LUT_FULL_SCALE_COUNTS must be a power of two"
+#endif
+#if (ESP_ANGLE_LUT_FULL_SCALE_COUNTS % ESP_ANGLE_LUT_BIN_COUNT) != 0
+#error "ESP_ANGLE_LUT_BIN_COUNT must divide the sensor full scale"
 #endif
 #if (ESP_ANGLE_LUT_BIN_COUNT & (ESP_ANGLE_LUT_BIN_COUNT - 1)) != 0
 #error "ESP_ANGLE_LUT_BIN_COUNT must be a power of two"
@@ -26,10 +30,21 @@ typedef struct {
   uint32_t magic;
   uint16_t format_version;
   uint16_t bin_count;
+  uint32_t full_scale_counts;
   uint32_t generation;
   uint32_t payload_crc32;
   int16_t corrections[ESP_ANGLE_LUT_BIN_COUNT];
 } angle_lut_blob_t;
+
+/* Version 1 used a fixed 16384-count scale. Keep it readable after upgrade. */
+typedef struct {
+  uint32_t magic;
+  uint16_t format_version;
+  uint16_t bin_count;
+  uint32_t generation;
+  uint32_t payload_crc32;
+  int16_t corrections[ESP_ANGLE_LUT_BIN_COUNT];
+} angle_lut_blob_v1_t;
 
 static const char *TAG = "ANGLE_LUT";
 static const char *const slot_keys[] = {"slot0", "slot1"};
@@ -49,8 +64,10 @@ static uint32_t payload_crc(const int16_t *corrections) {
 }
 
 static esp_err_t validate_table(const int16_t *corrections, size_t bin_count,
+                                uint32_t full_scale_counts,
                                 uint32_t expected_crc) {
-  if (corrections == NULL || bin_count != ESP_ANGLE_LUT_BIN_COUNT) {
+  if (corrections == NULL || bin_count != ESP_ANGLE_LUT_BIN_COUNT ||
+      full_scale_counts != ESP_ANGLE_LUT_FULL_SCALE_COUNTS) {
     return ESP_ERR_INVALID_ARG;
   }
   if (payload_crc(corrections) != expected_crc) {
@@ -58,11 +75,11 @@ static esp_err_t validate_table(const int16_t *corrections, size_t bin_count,
   }
 
   const int32_t bin_width =
-      ESP_ANGLE_LUT_SENSOR_COUNTS / ESP_ANGLE_LUT_BIN_COUNT;
+      ESP_ANGLE_LUT_FULL_SCALE_COUNTS / ESP_ANGLE_LUT_BIN_COUNT;
   for (size_t index = 0; index < ESP_ANGLE_LUT_BIN_COUNT; index++) {
     int32_t correction = corrections[index];
-    if (correction > CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS ||
-        correction < -CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS) {
+    if (correction > ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS ||
+        correction < -(int32_t)ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS) {
       return ESP_ERR_INVALID_ARG;
     }
     size_t next = (index + 1U) % ESP_ANGLE_LUT_BIN_COUNT;
@@ -79,19 +96,50 @@ static bool blob_valid(const angle_lut_blob_t *blob) {
   return blob->magic == LUT_MAGIC &&
          blob->format_version == ESP_ANGLE_LUT_FORMAT_VERSION &&
          blob->bin_count == ESP_ANGLE_LUT_BIN_COUNT &&
+         blob->full_scale_counts == ESP_ANGLE_LUT_FULL_SCALE_COUNTS &&
          validate_table(blob->corrections, blob->bin_count,
-                        blob->payload_crc32) == ESP_OK;
+                        blob->full_scale_counts, blob->payload_crc32) == ESP_OK;
 }
 
 static esp_err_t read_slot(nvs_handle_t handle, uint8_t slot,
                            angle_lut_blob_t *blob) {
-  size_t size = sizeof(*blob);
-  esp_err_t error = nvs_get_blob(handle, slot_keys[slot], blob, &size);
+  size_t size = 0U;
+  esp_err_t error = nvs_get_blob(handle, slot_keys[slot], NULL, &size);
   if (error != ESP_OK) {
     return error;
   }
-  return size == sizeof(*blob) && blob_valid(blob) ? ESP_OK
-                                                   : ESP_ERR_INVALID_CRC;
+  if (size == sizeof(*blob)) {
+    error = nvs_get_blob(handle, slot_keys[slot], blob, &size);
+    if (error != ESP_OK) {
+      return error;
+    }
+    return blob_valid(blob) ? ESP_OK : ESP_ERR_INVALID_CRC;
+  }
+  if (size == sizeof(angle_lut_blob_v1_t) &&
+      ESP_ANGLE_LUT_FULL_SCALE_COUNTS == 16384U) {
+    angle_lut_blob_v1_t legacy;
+    error = nvs_get_blob(handle, slot_keys[slot], &legacy, &size);
+    if (error != ESP_OK) {
+      return error;
+    }
+    if (legacy.magic != LUT_MAGIC || legacy.format_version != 1U ||
+        legacy.bin_count != ESP_ANGLE_LUT_BIN_COUNT ||
+        validate_table(legacy.corrections, legacy.bin_count, 16384U,
+                       legacy.payload_crc32) != ESP_OK) {
+      return ESP_ERR_INVALID_CRC;
+    }
+    *blob = (angle_lut_blob_t){
+        .magic = LUT_MAGIC,
+        .format_version = ESP_ANGLE_LUT_FORMAT_VERSION,
+        .bin_count = ESP_ANGLE_LUT_BIN_COUNT,
+        .full_scale_counts = 16384U,
+        .generation = legacy.generation,
+        .payload_crc32 = legacy.payload_crc32,
+    };
+    memcpy(blob->corrections, legacy.corrections, ESP_ANGLE_LUT_PAYLOAD_BYTES);
+    return ESP_OK;
+  }
+  return ESP_ERR_INVALID_SIZE;
 }
 
 static void activate_blob(const angle_lut_blob_t *blob, uint8_t slot) {
@@ -144,14 +192,16 @@ esp_err_t esp_angle_lut_init(void) {
 
   esp_angle_lut_status_t status;
   esp_angle_lut_get_status(&status);
-  ESP_LOGI(TAG, "initialized: loaded=%d enabled=%d generation=%lu bins=%u",
-           status.loaded, status.enabled, (unsigned long)status.generation,
-           status.bin_count);
+  ESP_LOGI(
+      TAG,
+      "initialized: loaded=%d enabled=%d generation=%lu bins=%u counts=%lu",
+      status.loaded, status.enabled, (unsigned long)status.generation,
+      status.bin_count, (unsigned long)status.full_scale_counts);
   return ESP_OK;
 }
 
 uint16_t esp_angle_lut_apply(uint16_t angle_counts) {
-  angle_counts &= ESP_ANGLE_LUT_SENSOR_COUNTS - 1U;
+  angle_counts &= ESP_ANGLE_LUT_FULL_SCALE_COUNTS - 1U;
   if (!atomic_load_explicit(&table_enabled, memory_order_acquire)) {
     return angle_counts;
   }
@@ -162,7 +212,7 @@ uint16_t esp_angle_lut_apply(uint16_t angle_counts) {
   }
 
   const uint32_t bin_width =
-      ESP_ANGLE_LUT_SENSOR_COUNTS / ESP_ANGLE_LUT_BIN_COUNT;
+      ESP_ANGLE_LUT_FULL_SCALE_COUNTS / ESP_ANGLE_LUT_BIN_COUNT;
   uint32_t index = angle_counts / bin_width;
   uint32_t fraction = angle_counts % bin_width;
   int32_t first = table[index];
@@ -170,19 +220,21 @@ uint16_t esp_angle_lut_apply(uint16_t angle_counts) {
   int32_t interpolated =
       first + ((second - first) * (int32_t)fraction) / (int32_t)bin_width;
   int32_t corrected = (int32_t)angle_counts + interpolated;
-  corrected %= (int32_t)ESP_ANGLE_LUT_SENSOR_COUNTS;
+  corrected %= (int32_t)ESP_ANGLE_LUT_FULL_SCALE_COUNTS;
   if (corrected < 0) {
-    corrected += ESP_ANGLE_LUT_SENSOR_COUNTS;
+    corrected += ESP_ANGLE_LUT_FULL_SCALE_COUNTS;
   }
   return (uint16_t)corrected;
 }
 
 esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
+                                uint32_t full_scale_counts,
                                 uint32_t payload_crc32) {
   if (!initialized) {
     return ESP_ERR_INVALID_STATE;
   }
-  esp_err_t error = validate_table(corrections, bin_count, payload_crc32);
+  esp_err_t error =
+      validate_table(corrections, bin_count, full_scale_counts, payload_crc32);
   if (error != ESP_OK) {
     return error;
   }
@@ -191,6 +243,7 @@ esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
       .magic = LUT_MAGIC,
       .format_version = ESP_ANGLE_LUT_FORMAT_VERSION,
       .bin_count = ESP_ANGLE_LUT_BIN_COUNT,
+      .full_scale_counts = ESP_ANGLE_LUT_FULL_SCALE_COUNTS,
       .generation = atomic_load(&table_generation) + 1U,
       .payload_crc32 = payload_crc32,
   };
@@ -297,6 +350,8 @@ void esp_angle_lut_get_status(esp_angle_lut_status_t *status) {
       .enabled = atomic_load(&table_enabled),
       .format_version = ESP_ANGLE_LUT_FORMAT_VERSION,
       .bin_count = ESP_ANGLE_LUT_BIN_COUNT,
+      .full_scale_counts = ESP_ANGLE_LUT_FULL_SCALE_COUNTS,
+      .max_abs_correction_counts = ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS,
       .generation = atomic_load(&table_generation),
       .payload_crc32 = atomic_load(&table_crc32),
   };

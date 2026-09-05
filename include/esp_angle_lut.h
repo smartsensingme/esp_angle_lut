@@ -11,16 +11,23 @@
 extern "C" {
 #endif
 
-#define ESP_ANGLE_LUT_SENSOR_COUNTS 16384U
-#define ESP_ANGLE_LUT_FORMAT_VERSION 1U
+#define ESP_ANGLE_LUT_FULL_SCALE_COUNTS CONFIG_ESP_ANGLE_LUT_FULL_SCALE_COUNTS
+#define ESP_ANGLE_LUT_FORMAT_VERSION 2U
 #define ESP_ANGLE_LUT_BIN_COUNT CONFIG_ESP_ANGLE_LUT_BIN_COUNT
 #define ESP_ANGLE_LUT_PAYLOAD_BYTES (ESP_ANGLE_LUT_BIN_COUNT * sizeof(int16_t))
+#define ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS                                \
+  ((CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS <                           \
+    (ESP_ANGLE_LUT_FULL_SCALE_COUNTS / 2U))                                    \
+       ? CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS                        \
+       : ((ESP_ANGLE_LUT_FULL_SCALE_COUNTS / 2U) - 1U))
 
 typedef struct {
   bool loaded;
   bool enabled;
   uint16_t format_version;
   uint16_t bin_count;
+  uint32_t full_scale_counts;
+  uint32_t max_abs_correction_counts;
   uint32_t generation;
   uint32_t payload_crc32;
 } esp_angle_lut_status_t;
@@ -28,11 +35,12 @@ typedef struct {
 /** Load the newest valid table from NVS. NVS flash must be initialized. */
 esp_err_t esp_angle_lut_init(void);
 
-/** Apply the active cyclic LUT to a 14-bit angle using linear interpolation. */
+/** Apply the active cyclic LUT to a native angle using linear interpolation. */
 uint16_t esp_angle_lut_apply(uint16_t angle_counts);
 
 /** Validate, persist and stage a new table. A newly installed table is off. */
 esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
+                                uint32_t full_scale_counts,
                                 uint32_t payload_crc32);
 
 /** Copy the installed table and its metadata. */
