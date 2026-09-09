@@ -16,10 +16,10 @@ extern "C" {
 #define ESP_ANGLE_LUT_BIN_COUNT CONFIG_ESP_ANGLE_LUT_BIN_COUNT
 #define ESP_ANGLE_LUT_PAYLOAD_BYTES (ESP_ANGLE_LUT_BIN_COUNT * sizeof(int16_t))
 #define ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS                                \
-  ((CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS <                           \
-    (ESP_ANGLE_LUT_FULL_SCALE_COUNTS / 2U))                                    \
-       ? CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS                        \
-       : ((ESP_ANGLE_LUT_FULL_SCALE_COUNTS / 2U) - 1U))
+  ((int32_t)((CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS <                 \
+              (ESP_ANGLE_LUT_FULL_SCALE_COUNTS / 2U))                          \
+                 ? CONFIG_ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS              \
+                 : ((ESP_ANGLE_LUT_FULL_SCALE_COUNTS / 2U) - 1U)))
 
 typedef struct {
   bool loaded;
@@ -32,6 +32,20 @@ typedef struct {
   uint32_t payload_crc32;
 } esp_angle_lut_status_t;
 
+typedef enum {
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NONE = 0,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NOT_INITIALIZED,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_METADATA,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_CRC,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_CORRECTION_RANGE,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NON_MONOTONIC,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_OPEN,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_BLOB_WRITE,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ACTIVE_WRITE,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ENABLED_WRITE,
+  ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_COMMIT,
+} esp_angle_lut_install_failure_t;
+
 /** Load the newest valid table from NVS. NVS flash must be initialized. */
 esp_err_t esp_angle_lut_init(void);
 
@@ -42,6 +56,15 @@ uint16_t esp_angle_lut_apply(uint16_t angle_counts);
 esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
                                 uint32_t full_scale_counts,
                                 uint32_t payload_crc32);
+
+/** Install a table and report the exact validation or persistence stage. */
+esp_err_t esp_angle_lut_install_detailed(
+    const int16_t *corrections, size_t bin_count, uint32_t full_scale_counts,
+    uint32_t payload_crc32, esp_angle_lut_install_failure_t *failure);
+
+/** Return the stable protocol name associated with an installation failure. */
+const char *
+esp_angle_lut_install_failure_name(esp_angle_lut_install_failure_t failure);
 
 /** Copy the installed table and its metadata. */
 esp_err_t esp_angle_lut_read(int16_t *corrections, size_t bin_count,

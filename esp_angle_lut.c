@@ -25,6 +25,8 @@
 
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
                "Angle LUT protocol requires a little-endian target");
+_Static_assert(!(-1 > ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS),
+               "Angle LUT correction limit must remain a signed expression");
 
 typedef struct {
   uint32_t magic;
@@ -49,6 +51,9 @@ typedef struct {
 static const char *TAG = "ANGLE_LUT";
 static const char *const slot_keys[] = {"slot0", "slot1"};
 static int16_t runtime_tables[2][ESP_ANGLE_LUT_BIN_COUNT];
+/* Installation calls deeply into NVS; keep its 500+ byte blob off task stacks.
+ */
+static angle_lut_blob_t install_blob;
 static atomic_uintptr_t active_table;
 static atomic_bool table_loaded;
 static atomic_bool table_enabled;
@@ -65,12 +70,19 @@ static uint32_t payload_crc(const int16_t *corrections) {
 
 static esp_err_t validate_table(const int16_t *corrections, size_t bin_count,
                                 uint32_t full_scale_counts,
-                                uint32_t expected_crc) {
+                                uint32_t expected_crc,
+                                esp_angle_lut_install_failure_t *failure) {
   if (corrections == NULL || bin_count != ESP_ANGLE_LUT_BIN_COUNT ||
       full_scale_counts != ESP_ANGLE_LUT_FULL_SCALE_COUNTS) {
+    if (failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_METADATA;
+    }
     return ESP_ERR_INVALID_ARG;
   }
   if (payload_crc(corrections) != expected_crc) {
+    if (failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_CRC;
+    }
     return ESP_ERR_INVALID_CRC;
   }
 
@@ -79,13 +91,24 @@ static esp_err_t validate_table(const int16_t *corrections, size_t bin_count,
   for (size_t index = 0; index < ESP_ANGLE_LUT_BIN_COUNT; index++) {
     int32_t correction = corrections[index];
     if (correction > ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS ||
-        correction < -(int32_t)ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS) {
+        correction < -ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS) {
+      if (failure != NULL) {
+        *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_CORRECTION_RANGE;
+      }
+      ESP_LOGE(TAG, "correction[%u]=%ld exceeds +/-%u counts", (unsigned)index,
+               (long)correction,
+               (unsigned)ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS);
       return ESP_ERR_INVALID_ARG;
     }
     size_t next = (index + 1U) % ESP_ANGLE_LUT_BIN_COUNT;
     int32_t corrected_step =
         bin_width + (int32_t)corrections[next] - correction;
     if (corrected_step <= 0 || corrected_step > 4 * bin_width) {
+      if (failure != NULL) {
+        *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NON_MONOTONIC;
+      }
+      ESP_LOGE(TAG, "corrected step[%u]=%ld outside 1..%ld counts",
+               (unsigned)index, (long)corrected_step, (long)(4 * bin_width));
       return ESP_ERR_INVALID_ARG;
     }
   }
@@ -98,7 +121,8 @@ static bool blob_valid(const angle_lut_blob_t *blob) {
          blob->bin_count == ESP_ANGLE_LUT_BIN_COUNT &&
          blob->full_scale_counts == ESP_ANGLE_LUT_FULL_SCALE_COUNTS &&
          validate_table(blob->corrections, blob->bin_count,
-                        blob->full_scale_counts, blob->payload_crc32) == ESP_OK;
+                        blob->full_scale_counts, blob->payload_crc32,
+                        NULL) == ESP_OK;
 }
 
 static esp_err_t read_slot(nvs_handle_t handle, uint8_t slot,
@@ -125,7 +149,7 @@ static esp_err_t read_slot(nvs_handle_t handle, uint8_t slot,
     if (legacy.magic != LUT_MAGIC || legacy.format_version != 1U ||
         legacy.bin_count != ESP_ANGLE_LUT_BIN_COUNT ||
         validate_table(legacy.corrections, legacy.bin_count, 16384U,
-                       legacy.payload_crc32) != ESP_OK) {
+                       legacy.payload_crc32, NULL) != ESP_OK) {
       return ESP_ERR_INVALID_CRC;
     }
     *blob = (angle_lut_blob_t){
@@ -230,16 +254,29 @@ uint16_t esp_angle_lut_apply(uint16_t angle_counts) {
 esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
                                 uint32_t full_scale_counts,
                                 uint32_t payload_crc32) {
+  return esp_angle_lut_install_detailed(corrections, bin_count,
+                                        full_scale_counts, payload_crc32, NULL);
+}
+
+esp_err_t esp_angle_lut_install_detailed(
+    const int16_t *corrections, size_t bin_count, uint32_t full_scale_counts,
+    uint32_t payload_crc32, esp_angle_lut_install_failure_t *failure) {
+  if (failure != NULL) {
+    *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NONE;
+  }
   if (!initialized) {
+    if (failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NOT_INITIALIZED;
+    }
     return ESP_ERR_INVALID_STATE;
   }
-  esp_err_t error =
-      validate_table(corrections, bin_count, full_scale_counts, payload_crc32);
+  esp_err_t error = validate_table(corrections, bin_count, full_scale_counts,
+                                   payload_crc32, failure);
   if (error != ESP_OK) {
     return error;
   }
 
-  angle_lut_blob_t blob = {
+  install_blob = (angle_lut_blob_t){
       .magic = LUT_MAGIC,
       .format_version = ESP_ANGLE_LUT_FORMAT_VERSION,
       .bin_count = ESP_ANGLE_LUT_BIN_COUNT,
@@ -247,33 +284,84 @@ esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
       .generation = atomic_load(&table_generation) + 1U,
       .payload_crc32 = payload_crc32,
   };
-  memcpy(blob.corrections, corrections, ESP_ANGLE_LUT_PAYLOAD_BYTES);
+  memcpy(install_blob.corrections, corrections, ESP_ANGLE_LUT_PAYLOAD_BYTES);
   uint8_t next_slot = atomic_load(&table_loaded) ? storage_slot ^ 1U : 0U;
 
   nvs_handle_t handle = 0;
   error = nvs_open(LUT_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (error != ESP_OK && failure != NULL) {
+    *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_OPEN;
+  }
   if (error == ESP_OK) {
-    error = nvs_set_blob(handle, slot_keys[next_slot], &blob, sizeof(blob));
+    error = nvs_set_blob(handle, slot_keys[next_slot], &install_blob,
+                         sizeof(install_blob));
+    if (error != ESP_OK && failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_BLOB_WRITE;
+    }
   }
   if (error == ESP_OK) {
     error = nvs_set_u8(handle, LUT_NVS_ACTIVE_KEY, next_slot);
+    if (error != ESP_OK && failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ACTIVE_WRITE;
+    }
   }
   if (error == ESP_OK) {
     error = nvs_set_u8(handle, LUT_NVS_ENABLED_KEY, 0U);
+    if (error != ESP_OK && failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ENABLED_WRITE;
+    }
   }
   if (error == ESP_OK) {
     error = nvs_commit(handle);
+    if (error != ESP_OK && failure != NULL) {
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_COMMIT;
+    }
   }
   if (handle != 0) {
     nvs_close(handle);
   }
   if (error != ESP_OK) {
+    ESP_LOGE(
+        TAG, "installation failed at %s: %s",
+        esp_angle_lut_install_failure_name(
+            failure != NULL ? *failure : ESP_ANGLE_LUT_INSTALL_FAILURE_NONE),
+        esp_err_to_name(error));
     return error;
   }
 
   atomic_store_explicit(&table_enabled, false, memory_order_release);
-  activate_blob(&blob, next_slot);
+  activate_blob(&install_blob, next_slot);
   return ESP_OK;
+}
+
+const char *
+esp_angle_lut_install_failure_name(esp_angle_lut_install_failure_t failure) {
+  switch (failure) {
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NONE:
+    return "none";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NOT_INITIALIZED:
+    return "not_initialized";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_METADATA:
+    return "invalid_metadata";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_CRC:
+    return "crc_mismatch";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_CORRECTION_RANGE:
+    return "correction_out_of_range";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NON_MONOTONIC:
+    return "non_monotonic_lut";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_OPEN:
+    return "nvs_open_failed";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_BLOB_WRITE:
+    return "nvs_blob_write_failed";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ACTIVE_WRITE:
+    return "nvs_active_write_failed";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ENABLED_WRITE:
+    return "nvs_enabled_write_failed";
+  case ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_COMMIT:
+    return "nvs_commit_failed";
+  default:
+    return "unknown_install_failure";
+  }
 }
 
 esp_err_t esp_angle_lut_read(int16_t *corrections, size_t bin_count,

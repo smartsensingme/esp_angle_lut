@@ -12,6 +12,10 @@ Each table carries a format version, generation and IEEE CRC32. Uploads are
 rejected when the CRC is wrong, the correction exceeds the configured bound,
 or the corrected angular map would cease to be monotonic. New tables are
 installed disabled and must be explicitly enabled after host-side validation.
+`esp_angle_lut_install_detailed()` identifies the exact failed validation or
+NVS persistence stage. Installation staging uses static internal storage so a
+caller with a small task stack does not also carry the persistent blob there;
+the original `esp_angle_lut_install()` API remains available.
 
 The table is expressed in signed native sensor counts and spans one revolution.
 The install API requires its source full scale and rejects a table generated
