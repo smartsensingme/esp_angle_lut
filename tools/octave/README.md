@@ -5,11 +5,16 @@ Esta pasta contém a biblioteca Octave que acompanha o componente embarcado
 serialização da LUT sem conhecer o sensor, a interface elétrica, o protocolo
 USB ou o perfil de controle usado para coletar os dados.
 
-Em outro projeto, adicione esta pasta ao caminho do Octave:
+Na raiz do repositório independente `esp_angle_lut`, adicione esta pasta ao
+caminho do Octave com:
 
 ```octave
-addpath ("components/esp_angle_lut/tools/octave");
+addpath ("tools/octave");
 ```
+
+Quando o repositório estiver instalado como componente de outro projeto, use
+`addpath ("components/esp_angle_lut/tools/octave")` a partir da raiz desse
+projeto.
 
 ## Relações entre as funções
 
@@ -296,8 +301,11 @@ Ele testa o vetor conhecido do CRC, serialização, cálculo e aplicação em 14
 12 bits e rejeição de uma LUT não monotônica:
 
 ```text
-octave --quiet components/esp_angle_lut/tools/octave/test_esp_angle_lut.m
+octave --quiet tools/octave/test_esp_angle_lut.m
 ```
+
+A partir da raiz de um projeto pai, o comando equivalente é
+`octave --quiet components/esp_angle_lut/tools/octave/test_esp_angle_lut.m`.
 
 O teste usa dados sintéticos e não depende de porta serial, pacote
 `instrument-control`, driver de sensor ou firmware conectado.

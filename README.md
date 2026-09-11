@@ -416,11 +416,16 @@ make the per-bin median more robust.
 
 ## Calculating a LUT in GNU Octave
 
-Add the reusable library to the Octave path:
+From the standalone `esp_angle_lut` repository root, add the reusable library
+to the Octave path with:
 
 ```octave
-addpath ("components/esp_angle_lut/tools/octave");
+addpath ("tools/octave");
 ```
+
+When the repository is checked out as an ESP-IDF component inside another
+project, use `addpath ("components/esp_angle_lut/tools/octave")` from that
+project's root instead.
 
 Assume the acquisition produced column vectors `time_s` and `raw_angle_deg`.
 The application has identified three stable intervals:
@@ -940,11 +945,14 @@ Detailed documentation for every Octave function and internal helper is in
 
 ## Testing the host library
 
-Run the sensor-independent regression test:
+Run the sensor-independent regression test from the standalone repository root:
 
 ```text
-octave --quiet components/esp_angle_lut/tools/octave/test_esp_angle_lut.m
+octave --quiet tools/octave/test_esp_angle_lut.m
 ```
+
+From a parent ESP-IDF project root, the equivalent command is
+`octave --quiet components/esp_angle_lut/tools/octave/test_esp_angle_lut.m`.
 
 The test verifies the canonical CRC vector, signed little-endian serialization,
 calculation and correction at 14- and 12-bit resolutions, and rejection of a
