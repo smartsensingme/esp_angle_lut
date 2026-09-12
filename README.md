@@ -364,12 +364,16 @@ void control_sample(void)
 - takes no lock;
 - uses bounded integer arithmetic;
 - supports concurrent publication of a new table;
+- executes from internal instruction RAM;
+- reads its active correction table from ordinary internal BSS and its
+  publication state from explicitly attributed internal DRAM;
 - returns a value in `[0, FULL_SCALE_COUNTS - 1]`.
 
-The function is suitable for a deterministic task, but is not declared
-`IRAM_ATTR`. An application that must execute while the flash cache is disabled
-needs an additional IRAM-safety review of this component and its complete call
-chain.
+The function is declared `IRAM_ATTR` and its runtime reader data is explicitly
+placed in DRAM. It can therefore remain available while the flash cache is
+disabled. This guarantee covers only `esp_angle_lut_apply()` itself: the caller,
+sensor driver, estimator, task stack, and the rest of the call chain still need
+their own cache-safety review.
 
 Do not call installation, enable/disable, readback, clear, or other NVS-related
 functions from the deterministic loop. Serialize those management operations

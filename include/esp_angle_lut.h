@@ -82,10 +82,17 @@ esp_err_t esp_angle_lut_init(void);
  * linearly interpolated, and the signed correction is added with cyclic
  * wraparound. If correction is disabled or no table is active, the normalized
  * input is returned unchanged. The function performs no NVS access, allocation
- * or locking and is suitable for a real-time sampling path.
+ * or locking and is placed in internal instruction RAM. Its active-table
+ * pointer and enable flag are explicitly placed in internal data RAM, while
+ * the double-buffered correction tables occupy ordinary internal BSS. This
+ * makes the bounded call suitable for a cache-disabled real-time sampling path
+ * after normal initialization without storing a zero-filled table image in
+ * flash.
  *
  * This is a public entry point called only by application code; no function
- * inside this component calls it.
+ * inside this component calls it. The caller, its remaining call graph, stack,
+ * and input/output state must independently satisfy the same cache-safety
+ * requirements.
  *
  * @param[in] angle_counts Raw absolute angle in native sensor counts.
  * @return Corrected angle in the range

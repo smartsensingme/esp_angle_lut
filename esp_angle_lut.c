@@ -1,5 +1,6 @@
 #include "esp_angle_lut.h"
 
+#include "esp_attr.h"
 #include "esp_crc.h"
 #include "esp_log.h"
 #include "nvs.h"
@@ -50,13 +51,15 @@ typedef struct {
 
 static const char *TAG = "ANGLE_LUT";
 static const char *const slot_keys[] = {"slot0", "slot1"};
+/* Ordinary zero-initialized component BSS is internal DRAM; keeping the tables
+ * there also avoids storing their 1 KiB zero image in flash. */
 static int16_t runtime_tables[2][ESP_ANGLE_LUT_BIN_COUNT];
 /* Installation calls deeply into NVS; keep its 500+ byte blob off task stacks.
  */
 static angle_lut_blob_t install_blob;
-static atomic_uintptr_t active_table;
+static DRAM_ATTR atomic_uintptr_t active_table;
 static atomic_bool table_loaded;
-static atomic_bool table_enabled;
+static DRAM_ATTR atomic_bool table_enabled;
 static atomic_uint_least32_t table_generation;
 static atomic_uint_least32_t table_crc32;
 static uint8_t runtime_table_index;
@@ -304,7 +307,7 @@ esp_err_t esp_angle_lut_init(void) {
   return ESP_OK;
 }
 
-uint16_t esp_angle_lut_apply(uint16_t angle_counts) {
+uint16_t IRAM_ATTR esp_angle_lut_apply(uint16_t angle_counts) {
   /* Normalize arbitrary uint16_t input efficiently using the power-of-two
    * scale. */
   angle_counts &= ESP_ANGLE_LUT_FULL_SCALE_COUNTS - 1U;
