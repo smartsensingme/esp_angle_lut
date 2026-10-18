@@ -200,9 +200,10 @@ Include the public API with:
 
 ## Firmware lifecycle
 
-The component is a singleton. It owns one Kconfig-selected configuration, one
-persistent calibration, and one lock-free runtime view. There is no instance
-handle.
+Legacy calls use the default instance and historical namespace. The handle API
+supports independent calibrations, enabled states and NVS identities. All
+instances share the Kconfig-selected table dimensions and count resolution.
+The following diagram describes the legacy default instance.
 
 ```text
 before init
@@ -363,10 +364,10 @@ void control_sample(void)
 - performs no logging;
 - takes no lock;
 - uses bounded integer arithmetic;
-- supports concurrent publication of a new table;
+- requires readers stopped during table installation/clear/lifecycle changes;
 - executes from internal instruction RAM;
-- reads its active correction table from ordinary internal BSS and its
-  publication state from explicitly attributed internal DRAM;
+- keeps the legacy default instance in internal static storage; handle instances
+  allocate their tables and publication state from internal-capability RAM;
 - returns a value in `[0, FULL_SCALE_COUNTS - 1]`.
 
 The function is declared `IRAM_ATTR` and its runtime reader data is explicitly
@@ -768,17 +769,17 @@ Other incompatible stored blobs are ignored.
 The component owns all runtime and persistent copies. Installation input and
 readback output belong to the caller and may be reused after the call returns.
 
-Two runtime tables allow atomic publication: the writer fills the inactive
-buffer and then publishes its pointer. `esp_angle_lut_apply()` acquires a
-complete immutable table without taking a lock.
+Each instance owns two runtime tables and installation staging. A completed
+buffer is published atomically, but repeated buffer reuse is not a reader
+reclamation protocol. **Stop sampling readers before installing/clearing a table,
+changing enablement or destroying an instance.** Resume after maintenance.
+Serialize all management and lifecycle calls (including different instances);
+there is no global list lock. Concurrent read-only apply calls are allowed while
+management is stopped. Legacy API callers follow the same maintenance contract.
+No flash write belongs in an active timing-sensitive sampling phase.
 
-Use one serialized management context for installation, readback,
-enable/disable, and clear operations. The supported concurrent pattern is a
-high-rate reader calling `esp_angle_lut_apply()` while one lower-priority
-management context publishes or changes a table. Do not launch simultaneous
-installation or clear operations from multiple tasks.
-
-Approximate static correction storage, excluding NVS library overhead, is:
+Approximate correction storage **per instance**, excluding context metadata and
+NVS library overhead, is:
 
 ```text
 two runtime tables    = 2 * BIN_COUNT * sizeof(int16_t)
@@ -1008,3 +1009,47 @@ count. Ensure the angle repeatedly covers the complete revolution.
 
 Tables are tied to full-scale and bin-count metadata. Changing either normally
 requires a new calibration.
+
+## Independent instances
+
+```c
+esp_angle_lut_handle_t left = NULL, right = NULL;
+ESP_ERROR_CHECK(esp_angle_lut_create("robot_left", &left));
+ESP_ERROR_CHECK(esp_angle_lut_create("robot_right", &right));
+/* Sampling, after maintenance has completed: */
+uint16_t corrected_left = esp_angle_lut_instance_apply(left, raw_left);
+uint16_t corrected_right = esp_angle_lut_instance_apply(right, raw_right);
+/* Stop/join sampling before maintenance or destruction. */
+ESP_ERROR_CHECK(esp_angle_lut_destroy(right));
+ESP_ERROR_CHECK(esp_angle_lut_destroy(left));
+```
+
+Initialize NVS first. Names are 1..15 bytes; `angle_lut` is reserved for legacy
+calls. Duplicate live namespaces are rejected. Creation copies the name,
+allocates internal RAM, restores that namespace's validated table or bypass,
+and leaves `*out=NULL` on error. Destroy frees RAM and retains NVS calibration.
+Tables have the same Kconfig-selected resolution/bin count but independent
+contents, generation, CRC, enabled state and redundant slots. Names must remain
+associated with the same physical sensors across reboots.
+
+Use `esp_angle_lut_instance_install[_detailed]`, `_read`, `_set_enabled`, `_clear`
+and `_get_status` with the handle first. Validation/units match the legacy API.
+NULL apply bypasses with normalization; NULL status is ignored. Other NULL
+instance management calls reject the request. No per-sample allocation or NVS.
+
+Installation durably disables the instance **before** writing a new blob or
+selector. Individual NVS keys are not a multi-key atomic transaction: interruption
+may retain either valid slot, but a new installation must not auto-enable.
+A failed installation can leave the old table disabled. Recheck status; enable
+only after readback/verification. Existing public signatures, default namespace,
+version-2 blob layout and compatible version-1 reads are retained.
+
+Native regression tests (mock individual persistent writes and injected failures;
+not a physical power-cut qualification):
+
+```sh
+sh tests/run.sh
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for the multi-instance API and maintenance
+contract changes, compatibility notes and validation limits.

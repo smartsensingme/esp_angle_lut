@@ -56,6 +56,62 @@ typedef enum {
   ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_COMMIT,
 } esp_angle_lut_install_failure_t;
 
+/** Opaque owned LUT instance; never copy or dereference. */
+typedef struct esp_angle_lut *esp_angle_lut_handle_t;
+
+/** Allocate internal RAM and restore a separate NVS namespace (1..15 bytes).
+ * NVS must already be initialized. Namespace "angle_lut" is reserved for legacy
+ * calls; duplicate live namespaces return INVALID_STATE. On failure *out=NULL.
+ * Serial maintenance context only; allocation/NVS are not real-time operations.
+ * Empty/corrupt tables create a valid bypassing instance. Returns INVALID_ARG,
+ * INVALID_STATE, NO_MEM or an NVS open error. One handle per physical sensor.
+ */
+esp_err_t esp_angle_lut_create(const char *nvs_namespace,
+                               esp_angle_lut_handle_t *out);
+/** Free instance RAM without erasing NVS. Stop all users first; serialize with
+ * other lifecycle/management calls. Returns INVALID_ARG for NULL/nonowned
+ * handle.
+ */
+esp_err_t esp_angle_lut_destroy(esp_angle_lut_handle_t lut);
+/** Bounded integer correction without I/O/allocation/locks. NULL bypasses.
+ * Instance must outlive the call. Stop readers before install/clear/destroy or
+ * enable changes: buffer publication does not protect repeated buffer reuse.
+ * Table coordinates must match calibration; apply before
+ * unwrap/differentiation.
+ */
+uint16_t esp_angle_lut_instance_apply(esp_angle_lut_handle_t lut,
+                                      uint16_t angle_counts);
+/** Same validation/units/errors as legacy install, for one handle. Maintenance
+ * only, readers stopped; every valid installation first durably disables the
+ * instance. Failure can leave it disabled. New tables never auto-enable.
+ */
+esp_err_t esp_angle_lut_instance_install(esp_angle_lut_handle_t lut,
+                                         const int16_t *corrections,
+                                         size_t bin_count,
+                                         uint32_t full_scale_counts,
+                                         uint32_t payload_crc32);
+/** Instance install with optional detailed failure output; same lifecycle. */
+esp_err_t esp_angle_lut_instance_install_detailed(
+    esp_angle_lut_handle_t lut, const int16_t *corrections, size_t bin_count,
+    uint32_t full_scale_counts, uint32_t payload_crc32,
+    esp_angle_lut_install_failure_t *failure);
+/** Copy table/status in serialized maintenance context; INVALID_STATE if no
+ * handle/table or invalid buffer/count. Destination is caller-owned. */
+esp_err_t esp_angle_lut_instance_read(esp_angle_lut_handle_t lut,
+                                      int16_t *corrections, size_t bin_count,
+                                      esp_angle_lut_status_t *status);
+/** Persist enablement; INVALID_STATE for NULL or enabling without a table.
+ * Readers stopped, maintenance only; NVS failures propagate. */
+esp_err_t esp_angle_lut_instance_set_enabled(esp_angle_lut_handle_t lut,
+                                             bool enabled);
+/** Disable and erase only this namespace's keys. Readers stopped; NVS errors
+ * propagate, missing keys tolerated. Failure leaves runtime disabled. */
+esp_err_t esp_angle_lut_instance_clear(esp_angle_lut_handle_t lut);
+/** Copy metadata; NULL handle/output is a no-op. Serialize against management
+ * to obtain a coherent snapshot; no NVS/allocation. */
+void esp_angle_lut_instance_get_status(esp_angle_lut_handle_t lut,
+                                       esp_angle_lut_status_t *status);
+
 /**
  * @brief Initialize the component and load the newest valid table from NVS.
  *
@@ -84,10 +140,10 @@ esp_err_t esp_angle_lut_init(void);
  * input is returned unchanged. The function performs no NVS access, allocation
  * or locking and is placed in internal instruction RAM. Its active-table
  * pointer and enable flag are explicitly placed in internal data RAM, while
- * the double-buffered correction tables occupy ordinary internal BSS. This
+ * the default correction tables occupy internal static storage. This
  * makes the bounded call suitable for a cache-disabled real-time sampling path
- * after normal initialization without storing a zero-filled table image in
- * flash.
+ * after normal initialization. Verify the final ELF and complete caller path
+ * before making any cache-off timing claim. Stop readers during maintenance.
  *
  * This is a public entry point called only by application code; no function
  * inside this component calls it. The caller, its remaining call graph, stack,
@@ -126,10 +182,15 @@ esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
 /**
  * @brief Validate, persist and stage a table with detailed failure reporting.
  *
+ * Maintenance only, with all readers stopped; this applies to legacy APIs too.
+ * Installation first durably disables correction and may leave it disabled on
+ * failure. Original signatures and the angle_lut namespace remain unchanged.
+ *
  * The table metadata, payload CRC, correction range and corrected-map
  * monotonicity are validated before any NVS write. The new blob is written to
  * the inactive slot, made the preferred slot, persisted as disabled, committed
- * atomically by NVS, and then published to the lock-free runtime buffer.
+ * after prior durable disablement, and then published to the runtime buffer.
+ * NVS does not provide a multi-key atomic transaction. Stop readers first.
  *
  * This is a public entry point. It is called internally only by
  * esp_angle_lut_install(); the USB transport may also call it directly.
@@ -203,6 +264,9 @@ esp_err_t esp_angle_lut_set_enabled(bool enabled);
 
 /**
  * @brief Disable correction and erase both persistent table slots.
+ *
+ * Maintenance only, with all readers stopped. Unexpected erase errors
+ * propagate.
  *
  * Correction is disabled in RAM before erasing NVS. After a successful commit,
  * all runtime metadata and the active pointer are cleared. Individual missing

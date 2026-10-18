@@ -2,10 +2,12 @@
 
 #include "esp_attr.h"
 #include "esp_crc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LUT_MAGIC 0x544C4741U /* "AGLT" in little endian. */
@@ -51,20 +53,26 @@ typedef struct {
 
 static const char *TAG = "ANGLE_LUT";
 static const char *const slot_keys[] = {"slot0", "slot1"};
-/* Ordinary zero-initialized component BSS is internal DRAM; keeping the tables
- * there also avoids storing their 1 KiB zero image in flash. */
-static int16_t runtime_tables[2][ESP_ANGLE_LUT_BIN_COUNT];
-/* Installation calls deeply into NVS; keep its 500+ byte blob off task stacks.
+/* Each instance owns runtime buffers, staging and a distinct NVS namespace.
+ * Management is serialized by the application; stop readers before mutation.
  */
-static angle_lut_blob_t install_blob;
-static DRAM_ATTR atomic_uintptr_t active_table;
-static atomic_bool table_loaded;
-static DRAM_ATTR atomic_bool table_enabled;
-static atomic_uint_least32_t table_generation;
-static atomic_uint_least32_t table_crc32;
-static uint8_t runtime_table_index;
-static uint8_t storage_slot;
-static bool initialized;
+struct esp_angle_lut {
+  int16_t runtime_tables[2][ESP_ANGLE_LUT_BIN_COUNT];
+  angle_lut_blob_t install_blob;
+  atomic_uintptr_t active_table;
+  atomic_bool table_loaded;
+  atomic_bool table_enabled;
+  atomic_uint_least32_t table_generation;
+  atomic_uint_least32_t table_crc32;
+  uint8_t runtime_table_index;
+  uint8_t storage_slot;
+  bool initialized;
+  char nvs_namespace[16];
+  struct esp_angle_lut *next;
+};
+static DRAM_ATTR struct esp_angle_lut default_instance = {
+    .nvs_namespace = LUT_NVS_NAMESPACE};
+static esp_angle_lut_handle_t instances;
 
 /**
  * @brief Calculate the IEEE CRC32 of one complete correction payload.
@@ -83,8 +91,9 @@ static uint32_t payload_crc(const int16_t *corrections) {
  * @brief Validate table metadata, payload integrity and angular monotonicity.
  *
  * This private helper is called by blob_valid(), read_slot() for legacy blobs,
- * and esp_angle_lut_install_detailed(). It optionally records the precise
- * public failure stage while returning the corresponding esp_err_t value.
+ * and esp_angle_lut_instance_install_detailed(). It optionally records the
+ * precise public failure stage while returning the corresponding esp_err_t
+ * value.
  */
 static esp_err_t validate_table(const int16_t *corrections, size_t bin_count,
                                 uint32_t full_scale_counts,
@@ -168,7 +177,7 @@ static bool blob_valid(const angle_lut_blob_t *blob) {
 /**
  * @brief Read and validate one persistent NVS slot.
  *
- * This private helper is called twice by esp_angle_lut_init(), once for the
+ * This private helper is called twice by load_instance(), once for the
  * preferred slot and once for the fallback. It calls blob_valid() for current
  * blobs and validate_table() while migrating a compatible version-1 blob.
  */
@@ -227,47 +236,48 @@ static esp_err_t read_slot(nvs_handle_t handle, uint8_t slot,
 /**
  * @brief Publish a validated blob to readers without exposing partial data.
  *
- * This private helper is called by esp_angle_lut_init() after loading NVS and
- * by esp_angle_lut_install_detailed() after committing a new table. It writes
- * the inactive runtime buffer first and publishes its pointer with release
- * ordering only after the complete table copy.
+ * This private helper is called by load_instance() after loading NVS and
+ * by esp_angle_lut_instance_install_detailed() after committing a new table. It
+ * writes the inactive runtime buffer first and publishes its pointer with
+ * release ordering only after the complete table copy.
  */
-static void activate_blob(const angle_lut_blob_t *blob, uint8_t slot) {
-  /* Prepare the buffer that cannot currently be observed by real-time readers.
-   */
-  uint8_t next_runtime = runtime_table_index ^ 1U;
-  memcpy(runtime_tables[next_runtime], blob->corrections,
+static void activate_blob(esp_angle_lut_handle_t lut,
+                          const angle_lut_blob_t *blob, uint8_t slot) {
+  /* Readers are stopped by the maintenance contract before buffer reuse. */
+  uint8_t next_runtime = lut->runtime_table_index ^ 1U;
+  memcpy(lut->runtime_tables[next_runtime], blob->corrections,
          ESP_ANGLE_LUT_PAYLOAD_BYTES);
 
   /* Atomically publish the completed table before updating bookkeeping. */
-  atomic_store_explicit(&active_table, (uintptr_t)runtime_tables[next_runtime],
+  atomic_store_explicit(&lut->active_table,
+                        (uintptr_t)lut->runtime_tables[next_runtime],
                         memory_order_release);
-  runtime_table_index = next_runtime;
-  storage_slot = slot;
+  lut->runtime_table_index = next_runtime;
+  lut->storage_slot = slot;
 
   /* Publish metadata corresponding to the newly active correction payload. */
-  atomic_store(&table_generation, blob->generation);
-  atomic_store(&table_crc32, blob->payload_crc32);
-  atomic_store(&table_loaded, true);
+  atomic_store(&lut->table_generation, blob->generation);
+  atomic_store(&lut->table_crc32, blob->payload_crc32);
+  atomic_store(&lut->table_loaded, true);
 }
 
-esp_err_t esp_angle_lut_init(void) {
+static esp_err_t load_instance(esp_angle_lut_handle_t lut) {
   /* Enforce the component's one-time initialization contract. */
-  if (initialized) {
+  if (lut->initialized) {
     return ESP_ERR_INVALID_STATE;
   }
 
   /* Establish a known lock-free state before any persistent data is inspected.
    */
-  atomic_init(&active_table, (uintptr_t)NULL);
-  atomic_init(&table_loaded, false);
-  atomic_init(&table_enabled, false);
-  atomic_init(&table_generation, 0U);
-  atomic_init(&table_crc32, 0U);
+  atomic_init(&lut->active_table, (uintptr_t)NULL);
+  atomic_init(&lut->table_loaded, false);
+  atomic_init(&lut->table_enabled, false);
+  atomic_init(&lut->table_generation, 0U);
+  atomic_init(&lut->table_crc32, 0U);
 
   /* Open the namespace shared by both redundant slots and control keys. */
   nvs_handle_t handle = 0;
-  esp_err_t error = nvs_open(LUT_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  esp_err_t error = nvs_open(lut->nvs_namespace, NVS_READWRITE, &handle);
   if (error != ESP_OK) {
     return error;
   }
@@ -284,21 +294,22 @@ esp_err_t esp_angle_lut_init(void) {
   esp_err_t preferred_error = read_slot(handle, preferred_slot, &preferred);
   esp_err_t fallback_error = read_slot(handle, preferred_slot ^ 1U, &fallback);
   if (preferred_error == ESP_OK) {
-    activate_blob(&preferred, preferred_slot);
+    activate_blob(lut, &preferred, preferred_slot);
   } else if (fallback_error == ESP_OK) {
-    activate_blob(&fallback, preferred_slot ^ 1U);
+    activate_blob(lut, &fallback, preferred_slot ^ 1U);
   }
 
   /* Restore enablement only when a valid table was successfully activated. */
   uint8_t enabled = 0U;
   (void)nvs_get_u8(handle, LUT_NVS_ENABLED_KEY, &enabled);
-  atomic_store(&table_enabled, atomic_load(&table_loaded) && enabled != 0U);
+  atomic_store(&lut->table_enabled,
+               atomic_load(&lut->table_loaded) && enabled != 0U);
   nvs_close(handle);
-  initialized = true;
+  lut->initialized = true;
 
   /* Log the same lock-free status snapshot exposed to application code. */
   esp_angle_lut_status_t status;
-  esp_angle_lut_get_status(&status);
+  esp_angle_lut_instance_get_status(lut, &status);
   ESP_LOGI(
       TAG,
       "initialized: loaded=%d enabled=%d generation=%lu bins=%u counts=%lu",
@@ -307,19 +318,21 @@ esp_err_t esp_angle_lut_init(void) {
   return ESP_OK;
 }
 
-uint16_t IRAM_ATTR esp_angle_lut_apply(uint16_t angle_counts) {
+uint16_t IRAM_ATTR esp_angle_lut_instance_apply(esp_angle_lut_handle_t lut,
+                                                uint16_t angle_counts) {
   /* Normalize arbitrary uint16_t input efficiently using the power-of-two
    * scale. */
   angle_counts &= ESP_ANGLE_LUT_FULL_SCALE_COUNTS - 1U;
 
   /* Bypass correction with minimal latency when the persisted state is off. */
-  if (!atomic_load_explicit(&table_enabled, memory_order_acquire)) {
+  if (!lut ||
+      !atomic_load_explicit(&lut->table_enabled, memory_order_acquire)) {
     return angle_counts;
   }
 
   /* Acquire the fully published immutable runtime buffer for this call. */
   const int16_t *table = (const int16_t *)atomic_load_explicit(
-      &active_table, memory_order_acquire);
+      &lut->active_table, memory_order_acquire);
   if (table == NULL) {
     return angle_counts;
   }
@@ -346,23 +359,63 @@ uint16_t IRAM_ATTR esp_angle_lut_apply(uint16_t angle_counts) {
   return (uint16_t)corrected;
 }
 
-esp_err_t esp_angle_lut_install(const int16_t *corrections, size_t bin_count,
-                                uint32_t full_scale_counts,
-                                uint32_t payload_crc32) {
-  /* Delegate to the detailed API when the caller does not need a failure stage.
+/* Maintenance-only enable persistence shared by installation and explicit
+ * enable changes. Retains exact NVS failure-stage reporting. */
+static esp_err_t persist_enabled(esp_angle_lut_handle_t lut, bool enabled,
+                                 esp_angle_lut_install_failure_t *failure) {
+  /* Enabling is meaningful only after initialization and a valid installation.
    */
-  return esp_angle_lut_install_detailed(corrections, bin_count,
-                                        full_scale_counts, payload_crc32, NULL);
+  if (!lut || !lut->initialized ||
+      (enabled && !atomic_load(&lut->table_loaded))) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  /* Persist the requested state before exposing it to real-time readers. */
+  nvs_handle_t handle = 0;
+  esp_err_t error = nvs_open(lut->nvs_namespace, NVS_READWRITE, &handle);
+  if (error != ESP_OK && failure)
+    *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_OPEN;
+  if (error == ESP_OK) {
+    error = nvs_set_u8(handle, LUT_NVS_ENABLED_KEY, enabled ? 1U : 0U);
+    if (error != ESP_OK && failure)
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_ENABLED_WRITE;
+  }
+  if (error == ESP_OK) {
+    error = nvs_commit(handle);
+    if (error != ESP_OK && failure)
+      *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_COMMIT;
+  }
+  if (handle != 0) {
+    nvs_close(handle);
+  }
+
+  /* Publish only a state that NVS has committed successfully. */
+  if (error == ESP_OK) {
+    atomic_store_explicit(&lut->table_enabled, enabled, memory_order_release);
+  }
+  return error;
 }
 
-esp_err_t esp_angle_lut_install_detailed(
-    const int16_t *corrections, size_t bin_count, uint32_t full_scale_counts,
-    uint32_t payload_crc32, esp_angle_lut_install_failure_t *failure) {
+esp_err_t esp_angle_lut_instance_install(esp_angle_lut_handle_t lut,
+                                         const int16_t *corrections,
+                                         size_t bin_count,
+                                         uint32_t full_scale_counts,
+                                         uint32_t payload_crc32) {
+  /* Delegate to the detailed API when the caller does not need a failure stage.
+   */
+  return esp_angle_lut_instance_install_detailed(
+      lut, corrections, bin_count, full_scale_counts, payload_crc32, NULL);
+}
+
+esp_err_t esp_angle_lut_instance_install_detailed(
+    esp_angle_lut_handle_t lut, const int16_t *corrections, size_t bin_count,
+    uint32_t full_scale_counts, uint32_t payload_crc32,
+    esp_angle_lut_install_failure_t *failure) {
   /* Initialize optional diagnostic output before any operation can fail. */
   if (failure != NULL) {
     *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NONE;
   }
-  if (!initialized) {
+  if (!lut || !lut->initialized) {
     if (failure != NULL) {
       *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NOT_INITIALIZED;
     }
@@ -376,29 +429,39 @@ esp_err_t esp_angle_lut_install_detailed(
     return error;
   }
 
-  /* Build the next versioned blob in static staging storage. */
-  install_blob = (angle_lut_blob_t){
+  /* Disable durably before touching the inactive slot or selector. NVS set
+   * operations are not a multi-key atomic transaction. An interrupted install
+   * may retain either validated table, but must never auto-enable a new one.
+   */
+  error = persist_enabled(lut, false, failure);
+  if (error != ESP_OK)
+    return error;
+
+  /* Build the next versioned blob in per-instance staging storage. */
+  lut->install_blob = (angle_lut_blob_t){
       .magic = LUT_MAGIC,
       .format_version = ESP_ANGLE_LUT_FORMAT_VERSION,
       .bin_count = ESP_ANGLE_LUT_BIN_COUNT,
       .full_scale_counts = ESP_ANGLE_LUT_FULL_SCALE_COUNTS,
-      .generation = atomic_load(&table_generation) + 1U,
+      .generation = atomic_load(&lut->table_generation) + 1U,
       .payload_crc32 = payload_crc32,
   };
-  memcpy(install_blob.corrections, corrections, ESP_ANGLE_LUT_PAYLOAD_BYTES);
+  memcpy(lut->install_blob.corrections, corrections,
+         ESP_ANGLE_LUT_PAYLOAD_BYTES);
 
   /* Preserve the active slot until the replacement has been written. */
-  uint8_t next_slot = atomic_load(&table_loaded) ? storage_slot ^ 1U : 0U;
+  uint8_t next_slot =
+      atomic_load(&lut->table_loaded) ? lut->storage_slot ^ 1U : 0U;
 
   /* Open NVS and write the complete replacement blob to the inactive slot. */
   nvs_handle_t handle = 0;
-  error = nvs_open(LUT_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  error = nvs_open(lut->nvs_namespace, NVS_READWRITE, &handle);
   if (error != ESP_OK && failure != NULL) {
     *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_OPEN;
   }
   if (error == ESP_OK) {
-    error = nvs_set_blob(handle, slot_keys[next_slot], &install_blob,
-                         sizeof(install_blob));
+    error = nvs_set_blob(handle, slot_keys[next_slot], &lut->install_blob,
+                         sizeof(lut->install_blob));
     if (error != ESP_OK && failure != NULL) {
       *failure = ESP_ANGLE_LUT_INSTALL_FAILURE_NVS_BLOB_WRITE;
     }
@@ -420,7 +483,7 @@ esp_err_t esp_angle_lut_install_detailed(
     }
   }
 
-  /* Make the blob, selected-slot key, and disabled state durable together. */
+  /* Commit pending storage operations; the disabled flag is already durable. */
   if (error == ESP_OK) {
     error = nvs_commit(handle);
     if (error != ESP_OK && failure != NULL) {
@@ -444,8 +507,8 @@ esp_err_t esp_angle_lut_install_detailed(
 
   /* Publish the committed table atomically, while leaving correction disabled.
    */
-  atomic_store_explicit(&table_enabled, false, memory_order_release);
-  activate_blob(&install_blob, next_slot);
+  atomic_store_explicit(&lut->table_enabled, false, memory_order_release);
+  activate_blob(lut, &lut->install_blob, next_slot);
   return ESP_OK;
 }
 
@@ -481,18 +544,19 @@ esp_angle_lut_install_failure_name(esp_angle_lut_install_failure_t failure) {
   }
 }
 
-esp_err_t esp_angle_lut_read(int16_t *corrections, size_t bin_count,
-                             esp_angle_lut_status_t *status) {
+esp_err_t esp_angle_lut_instance_read(esp_angle_lut_handle_t lut,
+                                      int16_t *corrections, size_t bin_count,
+                                      esp_angle_lut_status_t *status) {
   /* Validate destination capacity and require a published table. */
-  if (corrections == NULL || bin_count != ESP_ANGLE_LUT_BIN_COUNT ||
-      !atomic_load(&table_loaded)) {
+  if (!lut || corrections == NULL || bin_count != ESP_ANGLE_LUT_BIN_COUNT ||
+      !atomic_load(&lut->table_loaded)) {
     return ESP_ERR_INVALID_STATE;
   }
 
   /* Acquire the immutable table selected by the latest successful publication.
    */
   const int16_t *table = (const int16_t *)atomic_load_explicit(
-      &active_table, memory_order_acquire);
+      &lut->active_table, memory_order_acquire);
   if (table == NULL) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -500,56 +564,38 @@ esp_err_t esp_angle_lut_read(int16_t *corrections, size_t bin_count,
   /* Copy the complete payload before taking the optional metadata snapshot. */
   memcpy(corrections, table, ESP_ANGLE_LUT_PAYLOAD_BYTES);
   if (status != NULL) {
-    esp_angle_lut_get_status(status);
+    esp_angle_lut_instance_get_status(lut, status);
   }
   return ESP_OK;
 }
 
-esp_err_t esp_angle_lut_set_enabled(bool enabled) {
-  /* Enabling is meaningful only after initialization and a valid installation.
-   */
-  if (!initialized || (enabled && !atomic_load(&table_loaded))) {
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  /* Persist the requested state before exposing it to real-time readers. */
-  nvs_handle_t handle = 0;
-  esp_err_t error = nvs_open(LUT_NVS_NAMESPACE, NVS_READWRITE, &handle);
-  if (error == ESP_OK) {
-    error = nvs_set_u8(handle, LUT_NVS_ENABLED_KEY, enabled ? 1U : 0U);
-  }
-  if (error == ESP_OK) {
-    error = nvs_commit(handle);
-  }
-  if (handle != 0) {
-    nvs_close(handle);
-  }
-
-  /* Publish only a state that NVS has committed successfully. */
-  if (error == ESP_OK) {
-    atomic_store_explicit(&table_enabled, enabled, memory_order_release);
-  }
-  return error;
+esp_err_t esp_angle_lut_instance_set_enabled(esp_angle_lut_handle_t lut,
+                                             bool enabled) {
+  return persist_enabled(lut, enabled, NULL);
 }
 
-esp_err_t esp_angle_lut_clear(void) {
+esp_err_t esp_angle_lut_instance_clear(esp_angle_lut_handle_t lut) {
   /* Reject calls made before the component owns a valid runtime state. */
-  if (!initialized) {
+  if (!lut || !lut->initialized) {
     return ESP_ERR_INVALID_STATE;
   }
 
   /* Stop correction immediately so readers cannot use data being erased. */
-  atomic_store_explicit(&table_enabled, false, memory_order_release);
+  atomic_store_explicit(&lut->table_enabled, false, memory_order_release);
 
   /* Erase both redundant blobs and their selector/control metadata. */
   nvs_handle_t handle = 0;
-  esp_err_t error = nvs_open(LUT_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  esp_err_t error = nvs_open(lut->nvs_namespace, NVS_READWRITE, &handle);
   if (error == ESP_OK) {
-    (void)nvs_erase_key(handle, slot_keys[0]);
-    (void)nvs_erase_key(handle, slot_keys[1]);
-    (void)nvs_erase_key(handle, LUT_NVS_ACTIVE_KEY);
-    (void)nvs_erase_key(handle, LUT_NVS_ENABLED_KEY);
-    error = nvs_commit(handle);
+    const char *keys[] = {slot_keys[0], slot_keys[1], LUT_NVS_ACTIVE_KEY,
+                          LUT_NVS_ENABLED_KEY};
+    for (unsigned i = 0; i < 4 && error == ESP_OK; ++i) {
+      error = nvs_erase_key(handle, keys[i]);
+      if (error == ESP_ERR_NVS_NOT_FOUND)
+        error = ESP_OK;
+    }
+    if (error == ESP_OK)
+      error = nvs_commit(handle);
   }
   if (handle != 0) {
     nvs_close(handle);
@@ -557,30 +603,103 @@ esp_err_t esp_angle_lut_clear(void) {
 
   /* Forget the runtime table only after the persistent erase is durable. */
   if (error == ESP_OK) {
-    atomic_store(&table_loaded, false);
-    atomic_store(&table_generation, 0U);
-    atomic_store(&table_crc32, 0U);
-    atomic_store(&active_table, (uintptr_t)NULL);
+    atomic_store(&lut->table_loaded, false);
+    atomic_store(&lut->table_generation, 0U);
+    atomic_store(&lut->table_crc32, 0U);
+    atomic_store(&lut->active_table, (uintptr_t)NULL);
   }
   return error;
 }
 
-void esp_angle_lut_get_status(esp_angle_lut_status_t *status) {
+void esp_angle_lut_instance_get_status(esp_angle_lut_handle_t lut,
+                                       esp_angle_lut_status_t *status) {
   /* A null optional destination is intentionally a no-op. */
-  if (status == NULL) {
+  if (!lut || status == NULL) {
     return;
   }
 
   /* Combine immutable build metadata with atomically published runtime state.
    */
   *status = (esp_angle_lut_status_t){
-      .loaded = atomic_load(&table_loaded),
-      .enabled = atomic_load(&table_enabled),
+      .loaded = atomic_load(&lut->table_loaded),
+      .enabled = atomic_load(&lut->table_enabled),
       .format_version = ESP_ANGLE_LUT_FORMAT_VERSION,
       .bin_count = ESP_ANGLE_LUT_BIN_COUNT,
       .full_scale_counts = ESP_ANGLE_LUT_FULL_SCALE_COUNTS,
       .max_abs_correction_counts = ESP_ANGLE_LUT_MAX_ABS_CORRECTION_COUNTS,
-      .generation = atomic_load(&table_generation),
-      .payload_crc32 = atomic_load(&table_crc32),
+      .generation = atomic_load(&lut->table_generation),
+      .payload_crc32 = atomic_load(&lut->table_crc32),
   };
+}
+
+/* Lifecycle calls run only in the application's serialized maintenance context.
+ * No live readers may retain a handle being destroyed. */
+esp_err_t esp_angle_lut_create(const char *nvs_namespace,
+                               esp_angle_lut_handle_t *out) {
+  if (!out)
+    return ESP_ERR_INVALID_ARG;
+  *out = NULL;
+  if (!nvs_namespace || !nvs_namespace[0] || strlen(nvs_namespace) > 15 ||
+      strcmp(nvs_namespace, LUT_NVS_NAMESPACE) == 0)
+    return ESP_ERR_INVALID_ARG;
+  for (esp_angle_lut_handle_t p = instances; p; p = p->next)
+    if (strcmp(p->nvs_namespace, nvs_namespace) == 0)
+      return ESP_ERR_INVALID_STATE;
+  esp_angle_lut_handle_t lut =
+      heap_caps_calloc(1, sizeof(*lut), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!lut)
+    return ESP_ERR_NO_MEM;
+  memcpy(lut->nvs_namespace, nvs_namespace, strlen(nvs_namespace) + 1);
+  esp_err_t error = load_instance(lut);
+  if (error != ESP_OK) {
+    free(lut);
+    return error;
+  }
+  lut->next = instances;
+  instances = lut;
+  *out = lut;
+  return ESP_OK;
+}
+
+esp_err_t esp_angle_lut_destroy(esp_angle_lut_handle_t lut) {
+  if (!lut || lut == &default_instance)
+    return ESP_ERR_INVALID_ARG;
+  esp_angle_lut_handle_t *link = &instances;
+  while (*link && *link != lut)
+    link = &(*link)->next;
+  if (!*link)
+    return ESP_ERR_INVALID_ARG;
+  *link = lut->next;
+  free(lut);
+  return ESP_OK;
+}
+
+/* Legacy entry points preserve signatures and the historical NVS namespace. */
+esp_err_t esp_angle_lut_init(void) { return load_instance(&default_instance); }
+uint16_t IRAM_ATTR esp_angle_lut_apply(uint16_t angle) {
+  return esp_angle_lut_instance_apply(&default_instance, angle);
+}
+esp_err_t esp_angle_lut_install(const int16_t *c, size_t n, uint32_t scale,
+                                uint32_t crc) {
+  return esp_angle_lut_instance_install(&default_instance, c, n, scale, crc);
+}
+esp_err_t
+esp_angle_lut_install_detailed(const int16_t *c, size_t n, uint32_t scale,
+                               uint32_t crc,
+                               esp_angle_lut_install_failure_t *failure) {
+  return esp_angle_lut_instance_install_detailed(&default_instance, c, n, scale,
+                                                 crc, failure);
+}
+esp_err_t esp_angle_lut_read(int16_t *c, size_t n,
+                             esp_angle_lut_status_t *status) {
+  return esp_angle_lut_instance_read(&default_instance, c, n, status);
+}
+esp_err_t esp_angle_lut_set_enabled(bool enabled) {
+  return esp_angle_lut_instance_set_enabled(&default_instance, enabled);
+}
+esp_err_t esp_angle_lut_clear(void) {
+  return esp_angle_lut_instance_clear(&default_instance);
+}
+void esp_angle_lut_get_status(esp_angle_lut_status_t *status) {
+  esp_angle_lut_instance_get_status(&default_instance, status);
 }
